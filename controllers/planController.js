@@ -3,6 +3,7 @@ import { schema } from '../models/planSchema.js';
 import { generateEtag } from '../utils/etagGenerator.js';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
+import { verifyGoogleToken } from '../utils/authMiddleware.js';
 
 const ajv = new Ajv({ allErrors: true });
 addFormats(ajv);
@@ -11,6 +12,10 @@ const validate = ajv.compile(schema);
 
 export const createPlan = async (req, res) => {
   try {
+
+    const user = await verifyGoogleToken(req);
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
+
     const data = req.body;
 
     if (!validate(data)) {
@@ -34,7 +39,6 @@ export const createPlan = async (req, res) => {
     await redis.set(key, JSON.stringify(data));
 
     // Generate ETag
-    console.log('data1 for etag:', data);
     const etag = generateEtag(data);
 
     // Set Headers
@@ -56,10 +60,11 @@ export const createPlan = async (req, res) => {
   }
 };
 
-
 export const getPlan = async (req, res) => {
-  console.log("Fetching plan with ID:", req.params.id);
   try {
+    const user = await verifyGoogleToken(req);
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
+
     const key = `data:${req.params.id}`;
     const data = await redis.get(key);
 
@@ -70,10 +75,7 @@ export const getPlan = async (req, res) => {
     }
 
     const parsedData = JSON.parse(data);
-    console.log('data2 for etag:', parsedData);
     const etag = generateEtag(parsedData);
-    console.log('ETag:', etag);
-    console.log('Request ETag:', req.headers["if-none-match"]);
 
     if (req.headers["if-none-match"] === etag) {
       return res.status(304).send();
@@ -96,6 +98,9 @@ export const getPlan = async (req, res) => {
 
 export const deletePlan = async (req, res) => {
   try {
+    const user = await verifyGoogleToken(req);
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
+
     const key = `data:${req.params.id}`;
     const exists = await redis.exists(key);
 
@@ -113,5 +118,85 @@ export const deletePlan = async (req, res) => {
       message: 'Error deleting plan',
       error: error.message
     });
+  }
+};
+
+export const patchPlan = async (req, res) => {
+  try {
+    const user = await verifyGoogleToken(req);
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
+
+    const key = `data:${req.params.id}`;
+    const existingData = await redis.get(key);
+
+    if (!existingData) {
+      return res.status(404).json({ message: `Plan with ID: ${req.params.id} not found` });
+    }
+
+    const parsedData = JSON.parse(existingData);
+    const currentEtag = generateEtag(parsedData);
+
+    if (!req.headers["if-match"]) {
+      return res.status(428).json({
+        error: "Precondition Required",
+        message: "If-Match header is required for updates",
+      });
+    }
+    
+    // Check If-Match header
+    if (req.headers["if-match"] && req.headers["if-match"] !== currentEtag) {
+      return res.status(412).json({ message: "Precondition Failed: Data has changed" });
+    }
+
+  const mergedData = {
+    ...parsedData,
+    ...req.body
+  };
+  
+  // Handle the linkedPlanServices array specially
+  if (req.body.linkedPlanServices && req.body.linkedPlanServices.length > 0) {
+    // Create a map of existing services by objectId for easy lookup
+    const existingServicesMap = new Map();
+    parsedData.linkedPlanServices.forEach(service => {
+      existingServicesMap.set(service.objectId, service);
+    });
+    
+    // Initialize with existing services
+    const updatedServices = [...parsedData.linkedPlanServices];
+    
+    // Process each service in the request body
+    req.body.linkedPlanServices.forEach(newService => {
+      const existingServiceIndex = updatedServices.findIndex(
+        service => service.objectId === newService.objectId
+      );
+      
+      if (existingServiceIndex >= 0) {
+        // Update existing service
+        updatedServices[existingServiceIndex] = {
+          ...updatedServices[existingServiceIndex],
+          ...newService
+        };
+      } else {
+        // Add new service
+        updatedServices.push(newService);
+      }
+    });
+    
+    // Set the updated services array
+    mergedData.linkedPlanServices = updatedServices;
+  }
+
+    if (!validate(mergedData)) {
+      return res.status(400).json({ message: 'Validation failed', errors: validate.errors });
+    }
+
+    await redis.set(key, JSON.stringify(mergedData));
+    const newEtag = generateEtag(mergedData);
+
+    res.header('ETag', newEtag);
+    return res.status(200).json(mergedData);
+    // return res.status(200).json({ message: `Plan with ID: ${req.params.id} merged successfully` });
+  } catch (error) {
+    return res.status(500).json({ message: 'Error merging plan', error: error.message });
   }
 };
