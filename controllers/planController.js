@@ -4,6 +4,7 @@ import { generateEtag } from '../utils/etagGenerator.js';
 import Ajv from 'ajv';
 import addFormats from 'ajv-formats';
 import { verifyGoogleToken } from '../utils/authMiddleware.js';
+import rabbit from "../services/rabbitmq.service.js"
 
 const ajv = new Ajv({ allErrors: true });
 addFormats(ajv);
@@ -37,6 +38,14 @@ export const createPlan = async (req, res) => {
 
     // Store in Redis
     await redis.set(key, JSON.stringify(data));
+
+    console.log(">>>>>>>>> Puting in rabbit")
+    // Store in elastic index
+    rabbit.producer({
+      operation: "STORE",
+      body: data
+    });
+    console.log(">>>>>>>>> Done Puting in rabbit")
 
     // Generate ETag
     const etag = generateEtag(data);
@@ -110,7 +119,25 @@ export const deletePlan = async (req, res) => {
       });
     }
 
+    const data = await redis.get(key);
+
+    const parsed = JSON.parse(data);
+    // const currentEtag = generateEtag(parsed);
+
+    // if (req.headers["if-match"] && req.headers["if-match"] !== currentEtag) {
+    //   return res.status(412).json({
+    //     message: "Precondition Failed: Data has changed",
+    //   });
+    // }
+
     await redis.del(key);
+
+     // Delete from Elastic via Rabbit
+     rabbit.producer({
+      operation: "DELETE",
+      body: parsed
+    });
+
     return res.status(204).send();
   } catch (error) {
     console.error('Error deleting plan:', error);
@@ -191,6 +218,12 @@ export const patchPlan = async (req, res) => {
     }
 
     await redis.set(key, JSON.stringify(mergedData));
+
+    rabbit.producer({
+      operation: "STORE",
+      body: mergedData
+    });
+
     const newEtag = generateEtag(mergedData);
 
     res.header('ETag', newEtag);
